@@ -1,14 +1,17 @@
-name = "agent"
-main = "worker.js"
-compatibility_date = "2024-01-01"
+name = "my-single-file-agent"
+main = "worker.ts"
+compatibility_date = "2024-11-12"
 
+# 1. Define the Durable Object that powers the Agent
 [[durable_objects.bindings]]
-name = "AGENT"
-class_name = "AIAgent"
+name = "MyAgent"
+class_name = "MyAgent"
 
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["AIAgent"]
-
+# 2. Add AI binding for Llama 3
 [ai]
 binding = "AI"
+
+# 3. Enable SQLite for the Agent's state
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MyAgent"]
