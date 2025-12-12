@@ -1,0 +1,14 @@
+name = "ai-agent"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[[durable_objects.bindings]]
+name = "AGENT"
+class_name = "AIAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AIAgent"]
+
+[ai]
+binding = "AI"
