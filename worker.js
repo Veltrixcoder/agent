@@ -2,42 +2,59 @@ import { Agent } from "agents";
 
 // Define your AI Agent
 export class ChatAgent extends Agent {
-  async fetch(request) {
-    // Handle WebSocket upgrade
-    if (request.headers.get("Upgrade") === "websocket") {
-      const pair = new WebSocketPair();
-      const [client, server] = Object.values(pair);
-      
-      this.ctx.acceptWebSocket(server);
-      
-      // Initialize state when WebSocket connects
-      const state = await this.getState();
-      if (!state.conversationHistory) {
-        await this.setState({
-          conversationHistory: [],
-          createdAt: new Date().toISOString()
-        });
-      }
-      
-      // Send welcome message
-      server.send(JSON.stringify({
-        type: "welcome",
-        message: "Connected to AI Agent! How can I help you today?"
-      }));
-      
-      return new Response(null, {
-        status: 101,
-        webSocket: client
+  // Called when a WebSocket connects
+  async onConnect(connection, ctx) {
+    console.log("Client connected:", connection.id);
+    
+    // Initialize state if it doesn't exist
+    const state = await this.getState();
+    if (!state.conversationHistory) {
+      await this.setState({
+        conversationHistory: [],
+        createdAt: new Date().toISOString()
       });
     }
     
-    // Handle HTTP POST for messages
+    // Send welcome message
+    connection.send(JSON.stringify({
+      type: "welcome",
+      message: "Connected to AI Agent! How can I help you today?"
+    }));
+  }
+
+  // Called when a message is received via WebSocket
+  async onMessage(connection, message) {
+    try {
+      const data = JSON.parse(message);
+      const response = await this.handleMessage(data.content);
+      connection.send(JSON.stringify(response));
+    } catch (error) {
+      console.error("Message handling error:", error);
+      connection.send(JSON.stringify({
+        success: false,
+        error: "Failed to process message"
+      }));
+    }
+  }
+
+  // Called when a WebSocket disconnects
+  async onClose(connection, code, reason) {
+    console.log("Client disconnected:", connection.id, code, reason);
+  }
+
+  // Called on HTTP requests
+  async onRequest(request) {
     const url = new URL(request.url);
+    
+    // Handle HTTP POST for messages (fallback)
     if (url.pathname === "/message" && request.method === "POST") {
       const body = await request.json();
       const response = await this.handleMessage(body.content);
       return new Response(JSON.stringify(response), {
-        headers: { "Content-Type": "application/json" }
+        headers: { 
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
       });
     }
     
@@ -48,31 +65,20 @@ export class ChatAgent extends Agent {
         lastInteraction: new Date().toISOString()
       });
       return new Response(JSON.stringify({ success: true }), {
-        headers: { "Content-Type": "application/json" }
+        headers: { 
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
       });
     }
     
-    return new Response("Not Found", { status: 404 });
+    return new Response(JSON.stringify({ error: "Not Found" }), { 
+      status: 404,
+      headers: { "Content-Type": "application/json" }
+    });
   }
   
-  async webSocketMessage(ws, message) {
-    try {
-      const data = JSON.parse(message);
-      const response = await this.handleMessage(data.content);
-      ws.send(JSON.stringify(response));
-    } catch (error) {
-      console.error("WebSocket message error:", error);
-      ws.send(JSON.stringify({
-        success: false,
-        error: "Failed to process message"
-      }));
-    }
-  }
-  
-  async webSocketClose(ws, code, reason) {
-    console.log("WebSocket closed:", code, reason);
-  }
-  
+  // Handle message processing
   async handleMessage(content) {
     try {
       const state = await this.getState();
@@ -187,6 +193,11 @@ const HTML_PAGE = `<!DOCTYPE html>
       border-radius: 50%;
       background: #4ade80;
       animation: pulse 2s infinite;
+    }
+    
+    .status-dot.disconnected {
+      background: #ef4444;
+      animation: none;
     }
     
     @keyframes pulse {
@@ -368,8 +379,8 @@ const HTML_PAGE = `<!DOCTYPE html>
       <h1>🤖 AI Agent Chat</h1>
       <div>
         <div class="status">
-          <span class="status-dot"></span>
-          <span id="statusText">Connected</span>
+          <span class="status-dot" id="statusDot"></span>
+          <span id="statusText">Connecting...</span>
         </div>
         <button class="clear-btn" onclick="clearChat()">Clear Chat</button>
       </div>
@@ -400,6 +411,7 @@ const HTML_PAGE = `<!DOCTYPE html>
     const messageInput = document.getElementById('messageInput');
     const sendBtn = document.getElementById('sendBtn');
     const statusText = document.getElementById('statusText');
+    const statusDot = document.getElementById('statusDot');
     
     let agentId = localStorage.getItem('agentId') || crypto.randomUUID();
     localStorage.setItem('agentId', agentId);
@@ -407,11 +419,20 @@ const HTML_PAGE = `<!DOCTYPE html>
     let ws = null;
     let isConnecting = false;
     
+    function updateStatus(status) {
+      statusText.textContent = status;
+      if (status === 'Connected') {
+        statusDot.classList.remove('disconnected');
+      } else {
+        statusDot.classList.add('disconnected');
+      }
+    }
+    
     function connectWebSocket() {
       if (isConnecting || (ws && ws.readyState === WebSocket.OPEN)) return;
       
       isConnecting = true;
-      statusText.textContent = 'Connecting...';
+      updateStatus('Connecting...');
       
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = protocol + '//' + window.location.host + '/agent?id=' + agentId;
@@ -420,27 +441,39 @@ const HTML_PAGE = `<!DOCTYPE html>
       
       ws.onopen = () => {
         isConnecting = false;
-        statusText.textContent = 'Connected';
+        updateStatus('Connected');
         console.log('WebSocket connected');
       };
       
       ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.response) {
-          removeTypingIndicator();
-          addMessage(data.response, 'assistant');
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'welcome') {
+            console.log('Welcome message:', data.message);
+          } else if (data.response) {
+            removeTypingIndicator();
+            addMessage(data.response, 'assistant');
+          }
+        } catch (e) {
+          console.error('Failed to parse message:', e);
         }
       };
       
       ws.onerror = (error) => {
         console.error('WebSocket error:', error);
-        statusText.textContent = 'Error - Using HTTP';
+        updateStatus('Error - Using HTTP');
       };
       
       ws.onclose = () => {
         isConnecting = false;
-        statusText.textContent = 'Disconnected - Using HTTP';
+        updateStatus('Disconnected - Using HTTP');
         console.log('WebSocket disconnected');
+        // Try to reconnect after 3 seconds
+        setTimeout(() => {
+          if (!ws || ws.readyState === WebSocket.CLOSED) {
+            connectWebSocket();
+          }
+        }, 3000);
       };
     }
     
@@ -503,7 +536,7 @@ const HTML_PAGE = `<!DOCTYPE html>
           ws.send(JSON.stringify({ content: message }));
         } else {
           // Fallback to HTTP
-          const response = await fetch('/agent?id=' + agentId, {
+          const response = await fetch('/agent?id=' + agentId + '/message', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content: message })
@@ -532,7 +565,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       if (!confirm('Clear chat history?')) return;
       
       try {
-        const response = await fetch('/agent/clear?id=' + agentId, {
+        const response = await fetch('/agent?id=' + agentId + '/clear', {
           method: 'POST'
         });
         
@@ -576,24 +609,23 @@ export default {
       });
     }
     
-    // Clear chat history
-    if (url.pathname === "/agent/clear") {
-      const agentId = url.searchParams.get("id") || crypto.randomUUID();
-      const agent = env.ChatAgent.get(env.ChatAgent.idFromName(agentId));
-      
-      const response = await agent.fetch(new Request(`http://agent/clear`, {
-        method: "POST"
-      }));
-      return response;
-    }
-    
-    // Agent API endpoint
-    if (url.pathname === "/agent") {
+    // Agent endpoint - pass through to Durable Object
+    if (url.pathname.startsWith("/agent")) {
       const agentId = url.searchParams.get("id") || crypto.randomUUID();
       const id = env.ChatAgent.idFromName(agentId);
       const stub = env.ChatAgent.get(id);
       
-      // Pass through the request to the Durable Object
+      // For clear endpoint, rewrite the path
+      if (url.pathname.includes("/clear")) {
+        const newUrl = new URL(request.url);
+        newUrl.pathname = "/clear";
+        request = new Request(newUrl, request);
+      } else if (url.pathname.includes("/message")) {
+        const newUrl = new URL(request.url);
+        newUrl.pathname = "/message";
+        request = new Request(newUrl, request);
+      }
+      
       return stub.fetch(request);
     }
 
