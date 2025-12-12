@@ -8,32 +8,15 @@ compatibility_flags = ["nodejs_compat"]
 name = "ChatAgent"
 class_name = "ChatAgent"
 
-# Migration to enable SQL storage for the Agent
+# Migration to enable the ChatAgent Durable Object
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["AIAgent"]
-
-[[migrations]]
-tag = "v2"
-deleted_classes = ["AIAgent"]
-
-[[migrations]]
-tag = "v3"
-new_sqlite_classes = ["ChatAgent"]
+new_classes = ["ChatAgent"]
 
 # Workers AI binding for running AI models
 [ai]
 binding = "AI"
 
-# Optional: Environment variables
+# Environment variables
 [vars]
 ENVIRONMENT = "production"
-
-# Optional: Add AI Gateway for observability
-# [ai_gateway]
-# id = "your-gateway-id"
-
-# Optional: Vectorize binding for semantic search/memory
-# [[vectorize]]
-# binding = "VECTORIZE"
-# index_name = "agent-memory"
