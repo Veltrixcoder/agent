@@ -1,0 +1,16 @@
+{
+  "name": "agent",
+  "version": "1.0.0",
+  "description": "Cloudflare AI Agent with chat interface",
+  "main": "worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "agents": "^0.1.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.54.0"
+  }
+}
