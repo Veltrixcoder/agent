@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-// AI Agent Durable Object
+// AI Agent Durable Object with Internet Search
 export class ChatAgent extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -16,16 +16,13 @@ export class ChatAgent extends DurableObject {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       
-      // Accept the WebSocket connection
       this.ctx.acceptWebSocket(server);
       
-      // Initialize state
       const conversationHistory = (await this.ctx.storage.get("conversationHistory")) || [];
       
-      // Send welcome message
       server.send(JSON.stringify({
         type: "welcome",
-        message: "Connected to AI Agent! How can I help you today?"
+        message: "Connected to AI Agent with web search! How can I help you today?"
       }));
 
       return new Response(null, {
@@ -45,26 +42,104 @@ export class ChatAgent extends DurableObject {
     return new Response("Not Found", { status: 404 });
   }
 
+  async searchWeb(query) {
+    try {
+      // Use Firecrawl API to search and scrape
+      const response = await fetch('https://api.firecrawl.dev/v1/search', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer fc-10b48ef8488a472d9151d8545930c65e'
+        },
+        body: JSON.stringify({
+          query: query,
+          limit: 5,
+          scrapeOptions: {
+            formats: ['markdown'],
+            onlyMainContent: true
+          }
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Firecrawl API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error('Search error:', error);
+      return null;
+    }
+  }
+
+  detectSearchIntent(message) {
+    const searchKeywords = [
+      'search', 'find', 'look up', 'what is', 'who is', 'where is', 'when did',
+      'latest', 'current', 'recent', 'news', 'information about', 'tell me about',
+      'price of', 'weather', 'how to', 'tutorial', 'guide'
+    ];
+    
+    const lowerMessage = message.toLowerCase();
+    return searchKeywords.some(keyword => lowerMessage.includes(keyword));
+  }
+
   async webSocketMessage(ws, message) {
     try {
       const data = JSON.parse(message);
       
-      // Get conversation history
       let history = (await this.ctx.storage.get("conversationHistory")) || [];
       
-      // Add user message
       const userMessage = {
         role: "user",
         content: data.content,
         timestamp: new Date().toISOString()
       };
       history.push(userMessage);
+
+      // Detect if we need to search the web
+      const needsSearch = this.detectSearchIntent(data.content);
+      let searchContext = "";
+      let searchResults = null;
+
+      if (needsSearch) {
+        ws.send(JSON.stringify({
+          type: "status",
+          message: "🔍 Searching the web..."
+        }));
+
+        searchResults = await this.searchWeb(data.content);
+        
+        if (searchResults && searchResults.data && searchResults.data.length > 0) {
+          searchContext = "\n\nWeb Search Results:\n";
+          searchResults.data.slice(0, 3).forEach((result, index) => {
+            searchContext += `\n${index + 1}. ${result.title}\n`;
+            searchContext += `URL: ${result.url}\n`;
+            if (result.markdown) {
+              searchContext += `Content: ${result.markdown.substring(0, 500)}...\n`;
+            }
+          });
+          
+          ws.send(JSON.stringify({
+            type: "search",
+            results: searchResults.data.slice(0, 3)
+          }));
+        }
+      }
+
+      ws.send(JSON.stringify({
+        type: "status",
+        message: "💭 Thinking..."
+      }));
       
-      // Prepare messages for AI (keep last 10 messages for context)
+      const systemPrompt = needsSearch 
+        ? `You are a helpful AI assistant with access to current web information. Use the provided search results to give accurate, up-to-date answers. Always cite your sources when using information from the search results. Be concise and friendly.${searchContext}`
+        : "You are a helpful AI assistant. Be concise and friendly.";
+
       const aiMessages = [
         {
           role: "system",
-          content: "You are a helpful AI assistant. Be concise and friendly."
+          content: systemPrompt
         },
         ...history.slice(-10).map(msg => ({
           role: msg.role,
@@ -72,30 +147,27 @@ export class ChatAgent extends DurableObject {
         }))
       ];
       
-      // Call Cloudflare AI
       const aiResponse = await this.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
         messages: aiMessages
       });
       
-      // Extract response text
       const responseText = aiResponse.response || aiResponse.result?.response || "Sorry, I couldn't process that.";
       
-      // Add assistant message to history
       const assistantMessage = {
         role: "assistant",
         content: responseText,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        hasSearch: needsSearch
       };
       history.push(assistantMessage);
       
-      // Save updated history
       await this.ctx.storage.put("conversationHistory", history);
       
-      // Send response back
       ws.send(JSON.stringify({
         success: true,
         response: responseText,
-        messageCount: history.length
+        messageCount: history.length,
+        searchUsed: needsSearch
       }));
       
     } catch (error) {
@@ -117,58 +189,86 @@ export class ChatAgent extends DurableObject {
   }
 }
 
-// HTML Frontend
+// Enhanced HTML Frontend
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Agent Chat</title>
+    <title>AI Agent with Web Search</title>
     <style>
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
+        
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            height: 100vh;
+            min-height: 100vh;
             display: flex;
             justify-content: center;
             align-items: center;
+            padding: 20px;
         }
+        
         .chat-container {
-            width: 90%;
-            max-width: 800px;
+            width: 100%;
+            max-width: 1000px;
             height: 90vh;
-            background: white;
-            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 24px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             display: flex;
             flex-direction: column;
             overflow: hidden;
         }
+        
         .chat-header {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-            padding: 20px;
+            padding: 24px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
+        
+        .header-left {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        
         .chat-header h1 {
-            font-size: 24px;
+            font-size: 28px;
+            font-weight: 700;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
         }
+        
+        .header-subtitle {
+            font-size: 14px;
+            opacity: 0.9;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
         .status {
             display: flex;
             align-items: center;
             gap: 10px;
             font-size: 14px;
+            background: rgba(255,255,255,0.15);
+            padding: 8px 16px;
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
         }
+        
         .status-dot {
             width: 10px;
             height: 10px;
@@ -176,170 +276,390 @@ const HTML_PAGE = `<!DOCTYPE html>
             background: #4ade80;
             animation: pulse 2s infinite;
         }
+        
         .status-dot.disconnected {
             background: #ef4444;
             animation: none;
         }
+        
         @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.6; transform: scale(1.1); }
         }
+        
+        .header-actions {
+            display: flex;
+            gap: 10px;
+        }
+        
         .clear-btn {
             background: rgba(255,255,255,0.2);
             border: 1px solid rgba(255,255,255,0.3);
             color: white;
-            padding: 8px 16px;
-            border-radius: 8px;
+            padding: 10px 20px;
+            border-radius: 12px;
             cursor: pointer;
             font-size: 14px;
+            font-weight: 600;
             transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
+        
         .clear-btn:hover {
             background: rgba(255,255,255,0.3);
+            transform: translateY(-2px);
         }
+        
         .messages {
             flex: 1;
             overflow-y: auto;
-            padding: 20px;
+            padding: 24px;
             display: flex;
             flex-direction: column;
-            gap: 15px;
+            gap: 16px;
+            background: #f8f9fa;
         }
+        
+        .messages::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        .messages::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        
+        .messages::-webkit-scrollbar-thumb {
+            background: #cbd5e0;
+            border-radius: 4px;
+        }
+        
         .message {
             display: flex;
-            gap: 10px;
-            animation: slideIn 0.3s ease-out;
+            gap: 12px;
+            animation: slideIn 0.4s cubic-bezier(0.4, 0, 0.2, 1);
         }
+        
         @keyframes slideIn {
             from {
                 opacity: 0;
-                transform: translateY(10px);
+                transform: translateY(20px);
             }
             to {
                 opacity: 1;
                 transform: translateY(0);
             }
         }
+        
         .message.user {
             flex-direction: row-reverse;
         }
+        
+        .message-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+        
+        .message.user .message-avatar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        .message.assistant .message-avatar {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+        
         .message-content {
             max-width: 70%;
-            padding: 12px 16px;
+            padding: 16px 20px;
             border-radius: 18px;
             word-wrap: break-word;
+            line-height: 1.6;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
         }
+        
         .message.user .message-content {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             border-bottom-right-radius: 4px;
         }
+        
         .message.assistant .message-content {
-            background: #f3f4f6;
+            background: white;
             color: #1f2937;
             border-bottom-left-radius: 4px;
         }
+        
+        .search-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(102, 126, 234, 0.1);
+            color: #667eea;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        
+        .search-results {
+            margin-top: 12px;
+            padding: 12px;
+            background: rgba(102, 126, 234, 0.05);
+            border-radius: 12px;
+            border-left: 3px solid #667eea;
+        }
+        
+        .search-result-item {
+            margin-bottom: 8px;
+            font-size: 13px;
+        }
+        
+        .search-result-item a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        
+        .search-result-item a:hover {
+            text-decoration: underline;
+        }
+        
+        .status-message {
+            text-align: center;
+            padding: 12px;
+            background: rgba(102, 126, 234, 0.1);
+            border-radius: 12px;
+            color: #667eea;
+            font-size: 14px;
+            font-weight: 600;
+            animation: fadeIn 0.3s;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
         .welcome-message {
             text-align: center;
-            padding: 40px 20px;
+            padding: 60px 20px;
             color: #6b7280;
         }
+        
         .welcome-message h2 {
-            font-size: 28px;
-            margin-bottom: 10px;
-            color: #667eea;
+            font-size: 32px;
+            margin-bottom: 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-weight: 700;
         }
+        
+        .welcome-message p {
+            font-size: 16px;
+            margin-bottom: 24px;
+        }
+        
+        .features {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-top: 24px;
+        }
+        
+        .feature {
+            background: white;
+            padding: 16px 24px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 14px;
+            color: #4b5563;
+        }
+        
         .input-area {
-            padding: 20px;
-            background: #f9fafb;
+            padding: 24px;
+            background: white;
             border-top: 1px solid #e5e7eb;
             display: flex;
-            gap: 10px;
+            gap: 12px;
         }
-        #messageInput {
+        
+        .input-wrapper {
             flex: 1;
-            padding: 12px 16px;
+            position: relative;
+        }
+        
+        #messageInput {
+            width: 100%;
+            padding: 16px 20px;
             border: 2px solid #e5e7eb;
-            border-radius: 12px;
+            border-radius: 16px;
             font-size: 16px;
             outline: none;
-            transition: border-color 0.3s;
+            transition: all 0.3s;
+            font-family: inherit;
         }
+        
         #messageInput:focus {
             border-color: #667eea;
+            box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.1);
         }
+        
         #sendBtn {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             border: none;
-            padding: 12px 24px;
-            border-radius: 12px;
+            padding: 16px 32px;
+            border-radius: 16px;
             font-size: 16px;
             cursor: pointer;
-            transition: transform 0.2s;
+            transition: all 0.3s;
             font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
         }
+        
         #sendBtn:hover:not(:disabled) {
-            transform: scale(1.05);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4);
         }
+        
         #sendBtn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+            transform: none;
         }
+        
         .typing-indicator {
             display: none;
-            padding: 12px 16px;
-            background: #f3f4f6;
+            padding: 16px 20px;
+            background: white;
             border-radius: 18px;
             width: fit-content;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
         }
+        
         .typing-indicator.active {
-            display: block;
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
-        .typing-indicator span {
-            display: inline-block;
+        
+        .typing-dots {
+            display: flex;
+            gap: 4px;
+        }
+        
+        .typing-dots span {
             width: 8px;
             height: 8px;
             border-radius: 50%;
             background: #9ca3af;
-            margin: 0 2px;
             animation: typing 1.4s infinite;
         }
-        .typing-indicator span:nth-child(2) {
+        
+        .typing-dots span:nth-child(2) {
             animation-delay: 0.2s;
         }
-        .typing-indicator span:nth-child(3) {
+        
+        .typing-dots span:nth-child(3) {
             animation-delay: 0.4s;
         }
+        
         @keyframes typing {
-            0%, 60%, 100% { transform: translateY(0); }
-            30% { transform: translateY(-10px); }
+            0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+            30% { transform: translateY(-10px); opacity: 1; }
+        }
+        
+        @media (max-width: 768px) {
+            .chat-header h1 {
+                font-size: 20px;
+            }
+            
+            .header-subtitle {
+                font-size: 12px;
+            }
+            
+            .message-content {
+                max-width: 85%;
+            }
+            
+            .features {
+                flex-direction: column;
+            }
+            
+            .header-actions {
+                flex-direction: column;
+            }
         }
     </style>
 </head>
 <body>
     <div class="chat-container">
         <div class="chat-header">
-            <h1>🤖 AI Agent Chat</h1>
-            <div style="display: flex; align-items: center; gap: 15px;">
+            <div class="header-left">
+                <h1>🤖 AI Agent</h1>
+                <div class="header-subtitle">
+                    <span>🔍 Powered by Web Search</span>
+                    <span>•</span>
+                    <span>⚡ Cloudflare AI</span>
+                </div>
+            </div>
+            <div class="header-actions">
                 <div class="status">
                     <div class="status-dot" id="statusDot"></div>
                     <span id="statusText">Connecting...</span>
                 </div>
-                <button class="clear-btn" onclick="clearChat()">Clear Chat</button>
+                <button class="clear-btn" onclick="clearChat()">
+                    🗑️ Clear
+                </button>
             </div>
         </div>
         
         <div class="messages" id="messages">
             <div class="welcome-message">
-                <h2>👋 Welcome!</h2>
-                <p>Start chatting with your AI agent powered by Cloudflare</p>
+                <h2>👋 Welcome to AI Agent!</h2>
+                <p>I can search the web and answer your questions with up-to-date information</p>
+                <div class="features">
+                    <div class="feature">
+                        <span>🔍</span>
+                        <span>Real-time Web Search</span>
+                    </div>
+                    <div class="feature">
+                        <span>🧠</span>
+                        <span>AI-Powered Responses</span>
+                    </div>
+                    <div class="feature">
+                        <span>⚡</span>
+                        <span>Lightning Fast</span>
+                    </div>
+                </div>
             </div>
         </div>
         
         <div class="input-area">
-            <input type="text" id="messageInput" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
-            <button id="sendBtn" onclick="sendMessage()">Send ✉️</button>
+            <div class="input-wrapper">
+                <input type="text" id="messageInput" placeholder="Ask me anything... (I can search the web!)" onkeypress="handleKeyPress(event)">
+            </div>
+            <button id="sendBtn" onclick="sendMessage()">
+                <span>Send</span>
+                <span>✉️</span>
+            </button>
         </div>
     </div>
 
@@ -348,6 +668,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         let reconnectAttempts = 0;
         const maxReconnectAttempts = 5;
         const agentId = new URLSearchParams(window.location.search).get('id') || crypto.randomUUID();
+        let currentSearchResults = null;
 
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -369,16 +690,28 @@ const HTML_PAGE = `<!DOCTYPE html>
                     console.log('Received:', data);
                     
                     if (data.type === 'welcome') {
-                        // Don't display welcome message as a chat message
+                        return;
+                    }
+                    
+                    if (data.type === 'status') {
+                        showStatusMessage(data.message);
+                        return;
+                    }
+                    
+                    if (data.type === 'search') {
+                        currentSearchResults = data.results;
                         return;
                     }
                     
                     if (data.success && data.response) {
                         hideTypingIndicator();
-                        addMessage('assistant', data.response);
+                        hideStatusMessage();
+                        addMessage('assistant', data.response, data.searchUsed, currentSearchResults);
+                        currentSearchResults = null;
                     } else if (!data.success && data.error) {
                         hideTypingIndicator();
-                        addMessage('assistant', 'Error: ' + data.error);
+                        hideStatusMessage();
+                        addMessage('assistant', '❌ Error: ' + data.error);
                     }
                 } catch (error) {
                     console.error('Error parsing message:', error);
@@ -393,7 +726,6 @@ const HTML_PAGE = `<!DOCTYPE html>
                 console.log('WebSocket disconnected');
                 updateStatus(false);
                 
-                // Attempt to reconnect
                 if (reconnectAttempts < maxReconnectAttempts) {
                     reconnectAttempts++;
                     const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
@@ -416,7 +748,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }
         }
 
-        function addMessage(role, content) {
+        function addMessage(role, content, hasSearch = false, searchResults = null) {
             const messagesDiv = document.getElementById('messages');
             const welcomeMsg = messagesDiv.querySelector('.welcome-message');
             if (welcomeMsg) {
@@ -425,20 +757,69 @@ const HTML_PAGE = `<!DOCTYPE html>
             
             const messageDiv = document.createElement('div');
             messageDiv.className = \`message \${role}\`;
+            
+            let searchResultsHtml = '';
+            if (hasSearch && searchResults && searchResults.length > 0) {
+                searchResultsHtml = '<div class="search-results"><strong>🔍 Sources:</strong>';
+                searchResults.forEach((result, index) => {
+                    searchResultsHtml += \`
+                        <div class="search-result-item">
+                            \${index + 1}. <a href="\${result.url}" target="_blank">\${result.title}</a>
+                        </div>
+                    \`;
+                });
+                searchResultsHtml += '</div>';
+            }
+            
+            const avatar = role === 'user' ? '👤' : '🤖';
+            const badge = hasSearch ? '<div class="search-badge">🔍 Web Search Used</div>' : '';
+            
             messageDiv.innerHTML = \`
-                <div class="message-content">\${escapeHtml(content)}</div>
+                <div class="message-avatar">\${avatar}</div>
+                <div class="message-content">
+                    \${badge}
+                    \${escapeHtml(content)}
+                    \${searchResultsHtml}
+                </div>
             \`;
             
             messagesDiv.appendChild(messageDiv);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
 
+        function showStatusMessage(message) {
+            hideStatusMessage();
+            const messagesDiv = document.getElementById('messages');
+            const statusDiv = document.createElement('div');
+            statusDiv.className = 'status-message';
+            statusDiv.id = 'statusMessage';
+            statusDiv.textContent = message;
+            messagesDiv.appendChild(statusDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function hideStatusMessage() {
+            const statusMsg = document.getElementById('statusMessage');
+            if (statusMsg) {
+                statusMsg.remove();
+            }
+        }
+
         function showTypingIndicator() {
             const messagesDiv = document.getElementById('messages');
             const indicator = document.createElement('div');
-            indicator.className = 'typing-indicator active';
+            indicator.className = 'message assistant';
             indicator.id = 'typingIndicator';
-            indicator.innerHTML = '<span></span><span></span><span></span>';
+            indicator.innerHTML = \`
+                <div class="message-avatar">🤖</div>
+                <div class="typing-indicator active">
+                    <div class="typing-dots">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                    </div>
+                </div>
+            \`;
             messagesDiv.appendChild(indicator);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
@@ -466,6 +847,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             }));
             
             input.value = '';
+            input.focus();
         }
 
         function handleKeyPress(event) {
@@ -487,8 +869,22 @@ const HTML_PAGE = `<!DOCTYPE html>
                 if (response.ok) {
                     document.getElementById('messages').innerHTML = \`
                         <div class="welcome-message">
-                            <h2>👋 Welcome!</h2>
-                            <p>Start chatting with your AI agent powered by Cloudflare</p>
+                            <h2>👋 Welcome to AI Agent!</h2>
+                            <p>I can search the web and answer your questions with up-to-date information</p>
+                            <div class="features">
+                                <div class="feature">
+                                    <span>🔍</span>
+                                    <span>Real-time Web Search</span>
+                                </div>
+                                <div class="feature">
+                                    <span>🧠</span>
+                                    <span>AI-Powered Responses</span>
+                                </div>
+                                <div class="feature">
+                                    <span>⚡</span>
+                                    <span>Lightning Fast</span>
+                                </div>
+                            </div>
                         </div>
                     \`;
                 }
@@ -500,11 +896,14 @@ const HTML_PAGE = `<!DOCTYPE html>
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
-            return div.innerHTML;
+            return div.innerHTML.replace(/\n/g, '<br>');
         }
 
         // Connect on page load
         connectWebSocket();
+        
+        // Focus input on load
+        document.getElementById('messageInput').focus();
     </script>
 </body>
 </html>`;
@@ -541,7 +940,6 @@ export default {
       const id = env.ChatAgent.idFromName(agentId);
       const stub = env.ChatAgent.get(id);
       
-      // Pass through the request to the Durable Object
       return stub.fetch(request);
     }
 
@@ -555,7 +953,6 @@ export default {
       });
     }
 
-    // 404
     return new Response("Not Found", { status: 404 });
   }
 };
