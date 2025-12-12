@@ -5,7 +5,7 @@ compatibility_date = "2024-12-01"
 # Durable Objects bindings
 [[durable_objects.bindings]]
 name = "ChatAgent"
-class_name = "ChatAgent"
+class_name = "ChatAgentV2"
 script_name = "agent"
 
 # AI binding
@@ -18,5 +18,5 @@ ENVIRONMENT = "production"
 
 # REQUIRED: Migration for Durable Objects on free plan
 [[migrations]]
-tag = "v1"
-new_sqlite_classes = ["ChatAgent"]
+tag = "v4"
+new_sqlite_classes = ["ChatAgentV2"]
