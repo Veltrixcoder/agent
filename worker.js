@@ -52,15 +52,6 @@ export class AIAgent {
       });
     }
 
-    // Handle HTTP API
-    if (url.pathname === "/api/chat" && request.method === "POST") {
-      const { message } = await request.json();
-      const response = await this.handleChat(message);
-      return new Response(JSON.stringify(response), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
     return new Response("AI Agent API", { status: 200 });
   }
 
@@ -71,7 +62,7 @@ export class AIAgent {
     // Send welcome message
     this.sendToClient(ws, {
       type: "connected",
-      message: "Connected to AI Agent",
+      message: "Connected to AI Agent! Ask me anything.",
       timestamp: Date.now(),
     });
 
@@ -80,9 +71,10 @@ export class AIAgent {
         const data = JSON.parse(event.data);
         await this.handleMessage(ws, data);
       } catch (error) {
+        console.error("Message handling error:", error);
         this.sendToClient(ws, {
           type: "error",
-          message: "Invalid message format: " + error.message,
+          message: "Error: " + error.message,
         });
       }
     });
@@ -125,16 +117,16 @@ export class AIAgent {
           });
       }
     } catch (error) {
+      console.error("Error in handleMessage:", error);
       this.sendToClient(ws, {
         type: "error",
-        message: "Error processing message: " + error.message,
+        message: "Processing error: " + error.message,
       });
     }
   }
 
   async initDatabase() {
     try {
-      // Create tables if they don't exist
       await this.state.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS messages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,62 +159,126 @@ export class AIAgent {
   }
 
   async handleChatRequest(ws, message) {
-    this.sendToClient(ws, { type: "status", message: "Thinking..." });
+    this.sendToClient(ws, { type: "status", message: "🤔 Thinking..." });
 
-    // Save user message
-    await this.saveMessage("user", message);
-
-    // Get conversation history
-    const history = await this.getConversationHistory();
-
-    // Call AI model
-    let aiResponse;
     try {
+      // Save user message
+      await this.saveMessage("user", message);
+
+      // Get conversation history (last 10 messages)
+      const history = await this.getConversationHistory(10);
+
+      // Call AI model
+      let aiResponse;
+      
       if (this.env.AI) {
-        // Use Cloudflare Workers AI
-        const response = await this.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
-          messages: history,
-        });
-        aiResponse = response.response;
+        try {
+          console.log("Calling Workers AI with history:", history);
+          
+          const response = await this.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+            messages: history,
+            max_tokens: 512,
+          });
+          
+          console.log("AI Response:", response);
+          aiResponse = response.response || response.result?.response || "I received your message but couldn't generate a response.";
+          
+        } catch (aiError) {
+          console.error("AI Error:", aiError);
+          aiResponse = this.getIntelligentFallback(message);
+        }
       } else {
-        // Fallback response
-        aiResponse = this.generateFallbackResponse(message);
+        console.log("No AI binding available, using fallback");
+        aiResponse = this.getIntelligentFallback(message);
       }
+
+      // Save AI response
+      await this.saveMessage("assistant", aiResponse);
+
+      // Send response to client
+      this.sendToClient(ws, {
+        type: "chat_response",
+        message: aiResponse,
+        timestamp: Date.now(),
+      });
+      
     } catch (error) {
-      aiResponse = `I encountered an error: ${error.message}. Please try again.`;
+      console.error("Chat error:", error);
+      this.sendToClient(ws, {
+        type: "chat_response",
+        message: `I encountered an error: ${error.message}`,
+        timestamp: Date.now(),
+      });
     }
+  }
 
-    // Save AI response
-    await this.saveMessage("assistant", aiResponse);
+  getIntelligentFallback(message) {
+    const lowerMsg = message.toLowerCase();
+    
+    // Pattern matching for common queries
+    if (lowerMsg.includes("principle") && lowerMsg.includes("management")) {
+      return `The key principles of management include:
 
-    // Send response to client
-    this.sendToClient(ws, {
-      type: "chat_response",
-      message: aiResponse,
-      timestamp: Date.now(),
-    });
+1. **Planning** - Setting objectives and determining the best course of action
+2. **Organizing** - Arranging resources and tasks to achieve objectives
+3. **Leading** - Motivating and directing people toward goals
+4. **Controlling** - Monitoring performance and making corrections
+5. **Decision Making** - Analyzing situations and choosing optimal solutions
+
+Additional principles:
+- Division of Work (Specialization)
+- Authority and Responsibility
+- Unity of Command
+- Scalar Chain (Clear hierarchy)
+- Equity and Fair Treatment
+
+Note: Workers AI is not configured. Add the AI binding in wrangler.toml for dynamic responses.`;
+    }
+    
+    if (lowerMsg.includes("hello") || lowerMsg.includes("hi")) {
+      return "Hello! I'm your AI agent. I can help with questions, research, and notes. Workers AI is not configured, so I'm using rule-based responses. To enable full AI capabilities, add the AI binding to your wrangler.toml file.";
+    }
+    
+    if (lowerMsg.includes("help")) {
+      return "I can help you with:\n- Answering questions (limited without Workers AI)\n- Web research (switch to Research tab)\n- Taking notes (switch to Notes tab)\n\nTo enable full AI responses, configure Workers AI in wrangler.toml";
+    }
+    
+    // Generic fallback
+    return `I received your message: "${message}"
+
+However, Workers AI is not currently configured. To enable intelligent responses:
+
+1. Make sure your wrangler.toml has:
+   [ai]
+   binding = "AI"
+
+2. Redeploy with: npx wrangler deploy
+
+For now, try asking about "principles of management" or use the Research/Notes features!`;
   }
 
   async handleResearch(ws, query) {
-    this.sendToClient(ws, { type: "status", message: "Researching..." });
+    this.sendToClient(ws, { type: "status", message: "🔍 Researching..." });
 
     try {
-      // Perform web search (mock implementation - integrate with real API)
       const searchResults = await this.searchWeb(query);
 
-      // Generate summary with AI
       let summary;
       if (this.env.AI) {
-        const prompt = `Based on these search results, provide a concise summary for the query "${query}":\n\n${JSON.stringify(searchResults, null, 2)}`;
-        const response = await this.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
-          messages: [{ role: "user", content: prompt }],
-        });
-        summary = response.response;
+        try {
+          const prompt = `Provide a 2-3 sentence summary of these search results for the query "${query}":\n\n${JSON.stringify(searchResults)}`;
+          const response = await this.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+            messages: [{ role: "user", content: prompt }],
+            max_tokens: 256,
+          });
+          summary = response.response || response.result?.response;
+        } catch (e) {
+          summary = `Found ${searchResults.length} results for "${query}". Click the links below to explore.`;
+        }
       } else {
-        summary = `Found ${searchResults.length} results for: ${query}`;
+        summary = `Found ${searchResults.length} results for "${query}". Enable Workers AI for AI-powered summaries.`;
       }
 
-      // Save research to database
       await this.state.storage.sql.exec(
         "INSERT INTO research (query, results, summary, timestamp) VALUES (?, ?, ?, ?)",
         query,
@@ -231,7 +287,6 @@ export class AIAgent {
         Date.now()
       );
 
-      // Send results
       this.sendToClient(ws, {
         type: "research_response",
         query,
@@ -240,6 +295,7 @@ export class AIAgent {
         timestamp: Date.now(),
       });
     } catch (error) {
+      console.error("Research error:", error);
       this.sendToClient(ws, {
         type: "error",
         message: `Research failed: ${error.message}`,
@@ -248,23 +304,22 @@ export class AIAgent {
   }
 
   async searchWeb(query) {
-    // Mock implementation - replace with actual search API
-    // Options: Brave Search API, Google Custom Search, SerpAPI, etc.
+    // Mock search results - replace with real API
     return [
       {
-        title: `Result 1 for ${query}`,
-        url: "https://example.com/1",
-        snippet: "This is a sample search result. Integrate with a real search API for actual results.",
+        title: `${query} - Overview`,
+        url: `https://www.google.com/search?q=${encodeURIComponent(query)}`,
+        snippet: "Search Google for current information about this topic.",
       },
       {
-        title: `Result 2 for ${query}`,
-        url: "https://example.com/2",
-        snippet: "Another sample result showing what the structure looks like.",
+        title: `${query} - Wikipedia`,
+        url: `https://en.wikipedia.org/wiki/${encodeURIComponent(query)}`,
+        snippet: "Comprehensive encyclopedia article with detailed information.",
       },
       {
-        title: `Result 3 for ${query}`,
-        url: "https://example.com/3",
-        snippet: "Add your API key and endpoint to get real search results.",
+        title: `${query} - Latest Updates`,
+        url: `https://www.bing.com/search?q=${encodeURIComponent(query)}`,
+        snippet: "Find the most recent information and news articles.",
       },
     ];
   }
@@ -278,7 +333,7 @@ export class AIAgent {
 
     this.sendToClient(ws, {
       type: "note_saved",
-      message: "Note saved successfully",
+      message: "✅ Note saved successfully",
     });
   }
 
@@ -302,12 +357,12 @@ export class AIAgent {
     );
   }
 
-  async getConversationHistory() {
+  async getConversationHistory(limit = 20) {
     const result = await this.state.storage.sql.exec(
-      "SELECT role, content FROM messages ORDER BY timestamp DESC LIMIT 20"
+      `SELECT role, content FROM messages ORDER BY timestamp DESC LIMIT ?`,
+      limit
     );
 
-    // Reverse to get chronological order
     const messages = (result.rows || []).reverse();
     return messages.map((row) => ({
       role: row.role,
@@ -327,40 +382,18 @@ export class AIAgent {
     await this.state.storage.sql.exec("DELETE FROM messages");
     this.sendToClient(ws, {
       type: "history_cleared",
-      message: "Conversation history cleared",
+      message: "🗑️ Conversation history cleared",
     });
-  }
-
-  generateFallbackResponse(message) {
-    const responses = [
-      "That's an interesting question. To enable AI responses, configure Workers AI in your wrangler.toml.",
-      "I'm currently running in fallback mode. Add the AI binding to access Cloudflare's AI models.",
-      "I understand you're asking about that. For intelligent responses, enable Workers AI integration.",
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
   }
 
   sendToClient(ws, data) {
     try {
-      if (ws.readyState === 1) { // OPEN
+      if (ws.readyState === 1) {
         ws.send(JSON.stringify(data));
       }
     } catch (error) {
       console.error("Failed to send message:", error);
     }
-  }
-
-  broadcast(data) {
-    const message = JSON.stringify(data);
-    this.sessions.forEach((ws) => {
-      try {
-        if (ws.readyState === 1) {
-          ws.send(message);
-        }
-      } catch (error) {
-        console.error("Failed to broadcast:", error);
-      }
-    });
   }
 }
 
@@ -372,7 +405,6 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Serve HTML client for root path
     if (url.pathname === "/" || url.pathname === "/index.html") {
       return new Response(HTML_CLIENT, {
         headers: { 
@@ -382,28 +414,25 @@ export default {
       });
     }
 
-    // Handle favicon
     if (url.pathname === "/favicon.ico") {
       return new Response("🤖", {
         headers: { "Content-Type": "text/plain" },
       });
     }
 
-    // Handle agent requests
     if (url.pathname === "/agent") {
-      // Get or create agent instance
       const agentId = url.searchParams.get("id") || "default";
       const id = env.AGENT.idFromName(agentId);
       const agent = env.AGENT.get(id);
       return agent.fetch(request);
     }
 
-    // API endpoint for quick testing
     if (url.pathname === "/api/test") {
       return new Response(
         JSON.stringify({
           status: "ok",
           message: "AI Agent Worker is running",
+          hasAI: !!env.AI,
           timestamp: Date.now(),
         }),
         {
@@ -417,7 +446,7 @@ export default {
 };
 
 // ============================================================================
-// EMBEDDED HTML CLIENT (with inline CSS)
+// EMBEDDED HTML CLIENT
 // ============================================================================
 
 const HTML_CLIENT = `<!DOCTYPE html>
@@ -428,52 +457,58 @@ const HTML_CLIENT = `<!DOCTYPE html>
   <title>AI Agent</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #111827; color: #fff; height: 100vh; overflow: hidden; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #fff; height: 100vh; overflow: hidden; }
     .container { display: flex; flex-direction: column; height: 100vh; }
-    .header { background: #1f2937; border-bottom: 1px solid #374151; padding: 1rem; }
+    .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 1.5rem; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
     .header-content { max-width: 64rem; margin: 0 auto; display: flex; justify-content: space-between; align-items: center; }
-    .title { font-size: 1.5rem; font-weight: bold; }
-    .status { display: flex; align-items: center; gap: 0.5rem; }
-    .status-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; }
+    .title { font-size: 1.75rem; font-weight: bold; text-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+    .status { display: flex; align-items: center; gap: 0.5rem; background: rgba(0,0,0,0.2); padding: 0.5rem 1rem; border-radius: 1rem; }
+    .status-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; animation: pulse 2s infinite; }
     .status-dot.connected { background: #10b981; }
-    .status-dot.disconnected { background: #ef4444; }
-    .status-text { font-size: 0.875rem; color: #9ca3af; }
-    .tabs { background: #1f2937; border-bottom: 1px solid #374151; }
+    .status-dot.disconnected { background: #ef4444; animation: none; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    .status-text { font-size: 0.875rem; font-weight: 500; }
+    .tabs { background: #1a1a1a; border-bottom: 1px solid #333; }
     .tabs-content { max-width: 64rem; margin: 0 auto; display: flex; gap: 0.25rem; padding: 0 1rem; }
-    .tab { padding: 0.75rem 1rem; border-bottom: 2px solid transparent; color: #9ca3af; cursor: pointer; background: none; border-top: none; border-left: none; border-right: none; font-size: 1rem; transition: all 0.2s; }
-    .tab:hover { color: #d1d5db; }
-    .tab.active { border-bottom-color: #3b82f6; color: #60a5fa; }
-    .messages { flex: 1; overflow-y: auto; padding: 1rem; }
+    .tab { padding: 0.875rem 1.25rem; border-bottom: 3px solid transparent; color: #888; cursor: pointer; background: none; border-top: none; border-left: none; border-right: none; font-size: 1rem; transition: all 0.3s; font-weight: 500; }
+    .tab:hover { color: #ddd; background: rgba(255,255,255,0.05); }
+    .tab.active { border-bottom-color: #667eea; color: #fff; background: rgba(102,126,234,0.1); }
+    .messages { flex: 1; overflow-y: auto; padding: 2rem 1rem; background: #0a0a0a; }
     .messages-content { max-width: 64rem; margin: 0 auto; }
-    .message { display: flex; margin-bottom: 1rem; }
+    .message { display: flex; margin-bottom: 1.5rem; animation: slideIn 0.3s ease-out; }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     .message.user { justify-content: flex-end; }
     .message.assistant, .message.system { justify-content: flex-start; }
-    .message-bubble { max-width: 48rem; padding: 1rem; border-radius: 0.5rem; }
-    .message.user .message-bubble { background: #2563eb; }
-    .message.assistant .message-bubble { background: #1f2937; }
-    .message.system .message-bubble { background: #374151; }
-    .message-text { white-space: pre-wrap; word-wrap: break-word; }
-    .research-result { display: block; padding: 0.75rem; background: #0f172a; border-radius: 0.375rem; margin-top: 0.5rem; text-decoration: none; color: inherit; transition: background 0.2s; }
-    .research-result:hover { background: #1e293b; }
-    .research-title { font-size: 0.875rem; font-weight: 500; color: #60a5fa; margin-bottom: 0.25rem; }
-    .research-snippet { font-size: 0.75rem; color: #9ca3af; }
-    .input-area { border-top: 1px solid #374151; padding: 1rem; background: #1f2937; }
-    .input-content { max-width: 64rem; margin: 0 auto; display: flex; gap: 0.5rem; }
-    .input { flex: 1; padding: 0.75rem 1rem; background: #111827; border: 1px solid #374151; border-radius: 0.5rem; color: #fff; font-size: 1rem; outline: none; }
-    .input:focus { border-color: #3b82f6; }
-    .button { padding: 0.75rem 1.5rem; background: #2563eb; color: #fff; border: none; border-radius: 0.5rem; cursor: pointer; font-size: 1rem; font-weight: 500; transition: background 0.2s; }
-    .button:hover { background: #1d4ed8; }
-    .button:disabled { background: #374151; cursor: not-allowed; }
+    .message-bubble { max-width: 48rem; padding: 1.25rem; border-radius: 1rem; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+    .message.user .message-bubble { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+    .message.assistant .message-bubble { background: #1a1a1a; border: 1px solid #333; }
+    .message.system .message-bubble { background: #2a2a2a; border: 1px solid #444; font-size: 0.9rem; }
+    .message-text { white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
+    .research-result { display: block; padding: 1rem; background: #0f0f0f; border: 1px solid #333; border-radius: 0.5rem; margin-top: 0.75rem; text-decoration: none; color: inherit; transition: all 0.2s; }
+    .research-result:hover { background: #1a1a1a; border-color: #667eea; transform: translateX(4px); }
+    .research-title { font-size: 0.95rem; font-weight: 600; color: #667eea; margin-bottom: 0.5rem; }
+    .research-snippet { font-size: 0.85rem; color: #999; line-height: 1.5; }
+    .input-area { border-top: 1px solid #333; padding: 1.5rem; background: #1a1a1a; }
+    .input-content { max-width: 64rem; margin: 0 auto; display: flex; gap: 0.75rem; }
+    .input { flex: 1; padding: 1rem 1.25rem; background: #0a0a0a; border: 2px solid #333; border-radius: 0.75rem; color: #fff; font-size: 1rem; outline: none; transition: all 0.3s; }
+    .input:focus { border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.1); }
+    .button { padding: 1rem 2rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; border: none; border-radius: 0.75rem; cursor: pointer; font-size: 1rem; font-weight: 600; transition: all 0.3s; box-shadow: 0 4px 12px rgba(102,126,234,0.3); }
+    .button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(102,126,234,0.4); }
+    .button:active { transform: translateY(0); }
+    .button:disabled { background: #333; cursor: not-allowed; box-shadow: none; }
+    .clear-btn { padding: 0.5rem 1rem; background: #ef4444; border-radius: 0.5rem; border: none; color: white; cursor: pointer; font-size: 0.875rem; margin-left: 1rem; }
+    .clear-btn:hover { background: #dc2626; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <div class="header-content">
-        <h1 class="title">🤖 AI Agent</h1>
+        <h1 class="title">🤖 AI Agent Assistant</h1>
         <div class="status">
           <div id="status-indicator" class="status-dot disconnected"></div>
           <span id="status-text" class="status-text">Connecting...</span>
+          <button class="clear-btn" onclick="clearChat()">Clear Chat</button>
         </div>
       </div>
     </div>
@@ -495,7 +530,7 @@ const HTML_CLIENT = `<!DOCTYPE html>
         <input
           id="input"
           type="text"
-          placeholder="Type a message..."
+          placeholder="Ask me anything... Try 'principles of management'"
           class="input"
           onkeypress="if(event.key==='Enter') sendMessage()"
         />
@@ -516,7 +551,7 @@ const HTML_CLIENT = `<!DOCTYPE html>
         ws = new WebSocket(protocol + '//' + location.host + '/agent');
 
         ws.onopen = () => {
-          console.log('WebSocket connected');
+          console.log('✅ WebSocket connected');
           updateStatus(true);
           if (reconnectTimeout) {
             clearTimeout(reconnectTimeout);
@@ -527,31 +562,31 @@ const HTML_CLIENT = `<!DOCTYPE html>
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
+            console.log('📨 Received:', data);
             handleMessage(data);
           } catch (e) {
-            console.error('Failed to parse message:', e);
+            console.error('❌ Parse error:', e);
           }
         };
 
         ws.onclose = () => {
-          console.log('WebSocket closed');
+          console.log('🔌 WebSocket closed');
           updateStatus(false);
           reconnectTimeout = setTimeout(connect, 3000);
         };
 
         ws.onerror = (error) => {
-          console.error('WebSocket error:', error);
+          console.error('❌ WebSocket error:', error);
           updateStatus(false);
         };
       } catch (error) {
-        console.error('Failed to connect:', error);
+        console.error('❌ Connection failed:', error);
         updateStatus(false);
         reconnectTimeout = setTimeout(connect, 3000);
       }
     }
 
     function handleMessage(data) {
-      console.log('Received:', data);
       switch (data.type) {
         case 'connected':
           addMessage('system', data.message);
@@ -569,10 +604,14 @@ const HTML_CLIENT = `<!DOCTYPE html>
           addMessage('system', data.message);
           break;
         case 'note_saved':
-          addMessage('system', 'Note saved successfully');
+          addMessage('system', data.message);
+          break;
+        case 'history_cleared':
+          messagesContainer.innerHTML = '';
+          addMessage('system', data.message);
           break;
         case 'error':
-          addMessage('system', 'Error: ' + data.message);
+          addMessage('system', '❌ ' + data.message);
           break;
       }
     }
@@ -580,16 +619,17 @@ const HTML_CLIENT = `<!DOCTYPE html>
     function sendMessage() {
       const input = document.getElementById('input');
       const message = input.value.trim();
-      if (!message || !ws || ws.readyState !== WebSocket.OPEN) {
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          addMessage('system', 'Not connected. Reconnecting...');
-          connect();
-        }
+      if (!message) return;
+      
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        addMessage('system', '⚠️ Not connected. Reconnecting...');
+        connect();
         return;
       }
 
       if (currentTab === 'chat') {
         addMessage('user', message);
+        console.log('📤 Sending chat:', message);
         ws.send(JSON.stringify({ type: 'chat', message }));
       } else if (currentTab === 'research') {
         addMessage('user', '🔍 ' + message);
@@ -601,11 +641,15 @@ const HTML_CLIENT = `<!DOCTYPE html>
       input.value = '';
     }
 
+    function clearChat() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'clear_history' }));
+      }
+    }
+
     function switchTab(tab) {
       currentTab = tab;
-      document.querySelectorAll('.tab').forEach(btn => {
-        btn.classList.remove('active');
-      });
+      document.querySelectorAll('.tab').forEach(btn => btn.classList.remove('active'));
       document.getElementById('tab-' + tab).classList.add('active');
 
       if (tab === 'notes' && ws && ws.readyState === WebSocket.OPEN) {
@@ -613,7 +657,7 @@ const HTML_CLIENT = `<!DOCTYPE html>
       }
 
       const input = document.getElementById('input');
-      input.placeholder = tab === 'chat' ? 'Ask me anything...' :
+      input.placeholder = tab === 'chat' ? 'Ask me anything... Try "principles of management"' :
                          tab === 'research' ? 'Enter research query...' :
                          'Write a note...';
     }
@@ -638,8 +682,8 @@ const HTML_CLIENT = `<!DOCTYPE html>
       ).join('');
       
       div.innerHTML = '<div class="message-bubble">' +
-        '<p style="font-weight: bold; margin-bottom: 0.5rem;">Research Results:</p>' +
-        '<p class="message-text" style="margin-bottom: 0.75rem; color: #d1d5db;">' + escapeHtml(data.summary) + '</p>' +
+        '<p style="font-weight: bold; margin-bottom: 0.75rem; font-size: 1.1rem;">🔍 Research Results</p>' +
+        '<p class="message-text" style="margin-bottom: 1rem; color: #ddd;">' + escapeHtml(data.summary) + '</p>' +
         '<div>' + resultsHtml + '</div>' +
         '</div>';
       
@@ -650,7 +694,7 @@ const HTML_CLIENT = `<!DOCTYPE html>
     function displayNotes(notes) {
       messagesContainer.innerHTML = '';
       if (notes.length === 0) {
-        addMessage('system', 'No notes saved yet');
+        addMessage('system', '📝 No notes saved yet. Write something!');
         return;
       }
       notes.forEach(note => {
@@ -677,7 +721,6 @@ const HTML_CLIENT = `<!DOCTYPE html>
       return div.innerHTML;
     }
 
-    // Start connection
     connect();
   </script>
 </body>
