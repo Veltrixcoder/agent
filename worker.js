@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 // AI Agent Durable Object with Internet Search
-export class ChatAgentV2 extends DurableObject {
+export class ChatAgent extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.env = env;
@@ -947,4 +947,12 @@ export default {
     if (url.pathname === "/health") {
       return new Response(JSON.stringify({
         status: "healthy",
-        timestamp: new Date().toISO
+        timestamp: new Date().toISOString()
+      }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    return new Response("Not Found", { status: 404 });
+  }
+};
