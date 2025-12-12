@@ -1,17 +1,17 @@
-name = "my-single-file-agent"
-main = "worker.ts"
-compatibility_date = "2024-11-12"
+name = "cloudflare-ai-agent"
+main = "worker.js"
+compatibility_date = "2024-07-01"
 
-# 1. Define the Durable Object that powers the Agent
-[[durable_objects.bindings]]
-name = "MyAgent"
-class_name = "MyAgent"
-
-# 2. Add AI binding for Llama 3
+# 1. Enable Workers AI
 [ai]
 binding = "AI"
 
-# 3. Enable SQLite for the Agent's state
+# 2. Configure the Durable Object (The Agent)
+[[durable_objects.bindings]]
+name = "MY_AGENT"
+class_name = "MyAgent"
+
+# 3. Setup Migration for Agent's Built-in SQL State
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["MyAgent"]
