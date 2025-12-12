@@ -1,159 +1,175 @@
 import { Agent } from "agents";
 
-/**
- * The Frontend HTML
- * Served directly by the Agent when you visit the root URL.
- */
-const HTML = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cloudflare Agent Chat</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f0f2f5; display: flex; justify-content: center; height: 100vh; margin: 0; }
-        #app { width: 100%; max-width: 600px; background: white; display: flex; flex-direction: column; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-        header { padding: 20px; border-bottom: 1px solid #eee; background: #fff; z-index: 10; }
-        h1 { margin: 0; font-size: 1.2rem; color: #333; }
-        #chat-history { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 15px; }
-        .message { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; }
-        .user { align-self: flex-end; background: #0070f3; color: white; border-bottom-right-radius: 2px; }
-        .assistant { align-self: flex-start; background: #f0f0f0; color: #333; border-bottom-left-radius: 2px; }
-        form { padding: 20px; border-top: 1px solid #eee; display: flex; gap: 10px; background: #fff; }
-        input { flex: 1; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 16px; outline: none; }
-        input:focus { border-color: #0070f3; }
-        button { padding: 12px 24px; background: #0070f3; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
-        button:disabled { opacity: 0.7; cursor: not-allowed; }
-    </style>
-</head>
-<body>
-    <div id="app">
-        <header>
-            <h1>Agentic AI</h1>
-        </header>
-        <div id="chat-history">
-            </div>
-        <form id="chat-form">
-            <input type="text" id="message-input" placeholder="Type a message..." autocomplete="off" required>
-            <button type="submit">Send</button>
-        </form>
-    </div>
-
-    <script>
-        const form = document.getElementById('chat-form');
-        const input = document.getElementById('message-input');
-        const history = document.getElementById('chat-history');
-        const btn = form.querySelector('button');
-
-        function appendMessage(role, text) {
-            const div = document.createElement('div');
-            div.className = \`message \${role}\`;
-            div.textContent = text;
-            history.appendChild(div);
-            history.scrollTop = history.scrollHeight;
-        }
-
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const text = input.value.trim();
-            if (!text) return;
-
-            // UI Updates
-            appendMessage('user', text);
-            input.value = '';
-            btn.disabled = true;
-
-            try {
-                // Call the Agent API
-                const res = await fetch('/chat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: text })
-                });
-                
-                const data = await res.json();
-                appendMessage('assistant', data.response);
-            } catch (err) {
-                appendMessage('assistant', 'Error: Could not reach agent.');
-            } finally {
-                btn.disabled = false;
-                input.focus();
-            }
-        });
-    </script>
-</body>
-</html>
-`;
-
-/**
- * The Agent Logic
- * Handles both the UI requests and the AI Chat logic
- */
-export class MyAgent extends Agent {
-  
-  async onRequest(request) {
-    const url = new URL(request.url);
-
-    // 1. ROUTE: GET / -> Serve Frontend
-    if (url.pathname === "/" || url.pathname === "") {
-      return new Response(HTML, {
-        headers: { "Content-Type": "text/html;charset=UTF-8" }
-      });
-    }
+// Define your AI Agent
+export class ChatAgent extends Agent {
+  async onConnect(metadata) {
+    // Initialize agent state when a client connects
+    await this.setState({
+      conversationHistory: [],
+      userPreferences: metadata?.preferences || {},
+      createdAt: new Date().toISOString()
+    });
     
-    // 2. ROUTE: POST /chat -> Handle AI Logic
-    if (url.pathname === "/chat" && request.method === "POST") {
-      const body = await request.json();
-      const userMessage = body.message || "Hello";
-
-      // A. Get Context (History)
-      const history = this.sql`SELECT * FROM messages ORDER BY created_at DESC LIMIT 5`.toArray();
-
-      // B. Run Inference (Workers AI)
-      // Note: We reverse history here because we fetched DESC (newest first) but LLM needs chronological
-      const systemPrompt = { role: "system", content: "You are a helpful, witty autonomous agent." };
-      const context = history.reverse().map(h => ({ role: h.role, content: h.content }));
-      
-      const response = await this.env.AI.run("@cf/meta/llama-3-8b-instruct", {
-        messages: [systemPrompt, ...context, { role: "user", content: userMessage }]
-      });
-
-      const aiText = response.response;
-
-      // C. Save State
-      this.sql`INSERT INTO messages (role, content, created_at) VALUES ('user', ${userMessage}, ${Date.now()})`;
-      this.sql`INSERT INTO messages (role, content, created_at) VALUES ('assistant', ${aiText}, ${Date.now()})`;
-
-      return Response.json({ response: aiText });
-    }
-
-    return new Response("Not Found", { status: 404 });
+    return {
+      message: "Connected to AI Agent! How can I help you today?",
+      agentId: this.id
+    };
   }
 
-  // Setup Database Table
-  async onStart() {
-    this.sql`
-      CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        role TEXT,
-        content TEXT,
-        created_at INTEGER
-      )
-    `;
+  async onMessage(message) {
+    try {
+      const state = await this.getState();
+      const history = state.conversationHistory || [];
+      
+      // Add user message to history
+      history.push({
+        role: "user",
+        content: message.content,
+        timestamp: new Date().toISOString()
+      });
+
+      // Call AI model (using Workers AI)
+      const aiResponse = await this.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+        messages: [
+          {
+            role: "system",
+            content: "You are a helpful AI assistant. Be concise and friendly."
+          },
+          ...history.slice(-10) // Keep last 10 messages for context
+        ]
+      });
+
+      const assistantMessage = {
+        role: "assistant",
+        content: aiResponse.response,
+        timestamp: new Date().toISOString()
+      };
+
+      // Add AI response to history
+      history.push(assistantMessage);
+
+      // Update state
+      await this.setState({
+        conversationHistory: history,
+        lastInteraction: new Date().toISOString()
+      });
+
+      // Return response to client
+      return {
+        success: true,
+        response: aiResponse.response,
+        messageCount: history.length
+      };
+
+    } catch (error) {
+      console.error("Error processing message:", error);
+      return {
+        success: false,
+        error: "Failed to process your message. Please try again."
+      };
+    }
+  }
+
+  // Custom method to clear conversation history
+  async clearHistory() {
+    await this.setState({
+      conversationHistory: [],
+      lastInteraction: new Date().toISOString()
+    });
+    return { success: true, message: "Conversation history cleared" };
+  }
+
+  // Custom method to get conversation summary
+  async getSummary() {
+    const state = await this.getState();
+    const history = state.conversationHistory || [];
+    
+    return {
+      totalMessages: history.length,
+      createdAt: state.createdAt,
+      lastInteraction: state.lastInteraction,
+      messagePreview: history.slice(-3)
+    };
+  }
+
+  // Schedule a reminder task
+  async scheduleReminder(message, delayMinutes) {
+    const taskId = await this.schedule(async () => {
+      // This will run after the specified delay
+      await this.broadcast({
+        type: "reminder",
+        message: message,
+        scheduledFor: new Date().toISOString()
+      });
+    }, delayMinutes * 60 * 1000); // Convert minutes to milliseconds
+
+    return {
+      success: true,
+      taskId,
+      message: `Reminder scheduled for ${delayMinutes} minutes from now`
+    };
   }
 }
 
-/**
- * The Router
- * Forwards all internet traffic to the specific Agent instance.
- */
+// Main Worker entry point
 export default {
   async fetch(request, env) {
-    // We route everyone to a single persistent agent named "global-chat"
-    // In a multi-user app, you would change this ID based on the user's session/cookie
-    const id = env.MY_AGENT.idFromName("global-chat");
-    const stub = env.MY_AGENT.get(id);
-    return stub.fetch(request);
+    const url = new URL(request.url);
+    
+    // Route: Create or connect to an agent
+    if (url.pathname === "/agent") {
+      // Get or create agent with a specific ID
+      const agentId = url.searchParams.get("id") || crypto.randomUUID();
+      const agent = env.ChatAgent.get(env.ChatAgent.idFromName(agentId));
+      
+      // Handle WebSocket upgrade for real-time communication
+      if (request.headers.get("Upgrade") === "websocket") {
+        return agent.fetch(request);
+      }
+      
+      // HTTP API for agent operations
+      if (request.method === "POST") {
+        const body = await request.json();
+        const response = await agent.fetch(new Request(`http://agent/message`, {
+          method: "POST",
+          body: JSON.stringify(body)
+        }));
+        return response;
+      }
+      
+      return new Response(JSON.stringify({ agentId, endpoint: `/agent?id=${agentId}` }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // Route: Health check
+    if (url.pathname === "/health") {
+      return new Response(JSON.stringify({ 
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+        service: "Cloudflare AI Agent"
+      }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    // Default route
+    return new Response(JSON.stringify({
+      message: "Welcome to Cloudflare AI Agent API",
+      endpoints: {
+        agent: "/agent?id={agentId} - Create or connect to an agent",
+        health: "/health - Service health check"
+      },
+      usage: {
+        http: "POST to /agent with JSON body { content: 'your message' }",
+        websocket: "Connect to /agent with WebSocket for real-time chat"
+      }
+    }), {
+      status: 200,
+      headers: { 
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
   }
 };
