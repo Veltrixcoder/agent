@@ -1,17 +1,31 @@
-name = "cloudflare-ai-agent"
+name = "ai-agent-worker"
 main = "worker.js"
-compatibility_date = "2024-07-01"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
 
-# 1. Enable Workers AI
+# Durable Objects binding for the Agent
+[[durable_objects.bindings]]
+name = "ChatAgent"
+class_name = "ChatAgent"
+
+# Migration to enable SQL storage for the Agent
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatAgent"]
+
+# Workers AI binding for running AI models
 [ai]
 binding = "AI"
 
-# 2. Configure the Durable Object (The Agent)
-[[durable_objects.bindings]]
-name = "MY_AGENT"
-class_name = "MyAgent"
+# Optional: Environment variables
+[vars]
+ENVIRONMENT = "production"
 
-# 3. Setup Migration for Agent's Built-in SQL State
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["MyAgent"]
+# Optional: Add AI Gateway for observability
+# [ai_gateway]
+# id = "your-gateway-id"
+
+# Optional: Vectorize binding for semantic search/memory
+# [[vectorize]]
+# binding = "VECTORIZE"
+# index_name = "agent-memory"
