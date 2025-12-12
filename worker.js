@@ -1,131 +1,119 @@
-import { Agent } from "agents";
+import { DurableObject } from "cloudflare:workers";
 
-// Define your AI Agent
-export class ChatAgent extends Agent {
-  // Called when a WebSocket connects
-  async onConnect(connection, ctx) {
-    console.log("Client connected:", connection.id);
-    
-    // Initialize state if it doesn't exist
-    const state = await this.getState();
-    if (!state.conversationHistory) {
-      await this.setState({
-        conversationHistory: [],
-        createdAt: new Date().toISOString()
-      });
-    }
-    
-    // Send welcome message
-    connection.send(JSON.stringify({
-      type: "welcome",
-      message: "Connected to AI Agent! How can I help you today?"
-    }));
+// AI Agent Durable Object
+export class ChatAgent extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.env = env;
+    this.ctx = ctx;
   }
 
-  // Called when a message is received via WebSocket
-  async onMessage(connection, message) {
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    // Handle WebSocket upgrade
+    if (request.headers.get("Upgrade") === "websocket") {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      
+      // Accept the WebSocket connection
+      this.ctx.acceptWebSocket(server);
+      
+      // Initialize state
+      const conversationHistory = (await this.ctx.storage.get("conversationHistory")) || [];
+      
+      // Send welcome message
+      server.send(JSON.stringify({
+        type: "welcome",
+        message: "Connected to AI Agent! How can I help you today?"
+      }));
+
+      return new Response(null, {
+        status: 101,
+        webSocket: client
+      });
+    }
+
+    // Handle clear history
+    if (url.pathname === "/clear" && request.method === "POST") {
+      await this.ctx.storage.put("conversationHistory", []);
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    return new Response("Not Found", { status: 404 });
+  }
+
+  async webSocketMessage(ws, message) {
     try {
       const data = JSON.parse(message);
-      const response = await this.handleMessage(data.content);
-      connection.send(JSON.stringify(response));
+      
+      // Get conversation history
+      let history = (await this.ctx.storage.get("conversationHistory")) || [];
+      
+      // Add user message
+      const userMessage = {
+        role: "user",
+        content: data.content,
+        timestamp: new Date().toISOString()
+      };
+      history.push(userMessage);
+      
+      // Prepare messages for AI (keep last 10 messages for context)
+      const aiMessages = [
+        {
+          role: "system",
+          content: "You are a helpful AI assistant. Be concise and friendly."
+        },
+        ...history.slice(-10).map(msg => ({
+          role: msg.role,
+          content: msg.content
+        }))
+      ];
+      
+      // Call Cloudflare AI
+      const aiResponse = await this.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+        messages: aiMessages
+      });
+      
+      // Extract response text
+      const responseText = aiResponse.response || aiResponse.result?.response || "Sorry, I couldn't process that.";
+      
+      // Add assistant message to history
+      const assistantMessage = {
+        role: "assistant",
+        content: responseText,
+        timestamp: new Date().toISOString()
+      };
+      history.push(assistantMessage);
+      
+      // Save updated history
+      await this.ctx.storage.put("conversationHistory", history);
+      
+      // Send response back
+      ws.send(JSON.stringify({
+        success: true,
+        response: responseText,
+        messageCount: history.length
+      }));
+      
     } catch (error) {
-      console.error("Message handling error:", error);
-      connection.send(JSON.stringify({
+      console.error("WebSocket message error:", error);
+      ws.send(JSON.stringify({
         success: false,
-        error: "Failed to process message"
+        error: "Failed to process message: " + error.message
       }));
     }
   }
 
-  // Called when a WebSocket disconnects
-  async onClose(connection, code, reason) {
-    console.log("Client disconnected:", connection.id, code, reason);
+  async webSocketClose(ws, code, reason, wasClean) {
+    console.log("WebSocket closed:", code, reason, wasClean);
+    ws.close(1000, "Durable Object is closing WebSocket");
   }
 
-  // Called on HTTP requests
-  async onRequest(request) {
-    const url = new URL(request.url);
-    
-    // Handle HTTP POST for messages (fallback)
-    if (url.pathname === "/message" && request.method === "POST") {
-      const body = await request.json();
-      const response = await this.handleMessage(body.content);
-      return new Response(JSON.stringify(response), {
-        headers: { 
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*"
-        }
-      });
-    }
-    
-    // Handle clear history
-    if (url.pathname === "/clear" && request.method === "POST") {
-      await this.setState({
-        conversationHistory: [],
-        lastInteraction: new Date().toISOString()
-      });
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { 
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*"
-        }
-      });
-    }
-    
-    return new Response(JSON.stringify({ error: "Not Found" }), { 
-      status: 404,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-  
-  // Handle message processing
-  async handleMessage(content) {
-    try {
-      const state = await this.getState();
-      const history = state.conversationHistory || [];
-      
-      history.push({
-        role: "user",
-        content: content,
-        timestamp: new Date().toISOString()
-      });
-
-      const aiResponse = await this.env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
-        messages: [
-          {
-            role: "system",
-            content: "You are a helpful AI assistant. Be concise and friendly."
-          },
-          ...history.slice(-10)
-        ]
-      });
-
-      const assistantMessage = {
-        role: "assistant",
-        content: aiResponse.response,
-        timestamp: new Date().toISOString()
-      };
-
-      history.push(assistantMessage);
-
-      await this.setState({
-        conversationHistory: history,
-        lastInteraction: new Date().toISOString()
-      });
-
-      return {
-        success: true,
-        response: aiResponse.response,
-        messageCount: history.length
-      };
-
-    } catch (error) {
-      console.error("Error processing message:", error);
-      return {
-        success: false,
-        error: "Failed to process your message. Please try again."
-      };
-    }
+  async webSocketError(ws, error) {
+    console.error("WebSocket error:", error);
   }
 }
 
@@ -133,464 +121,391 @@ export class ChatAgent extends Agent {
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cloudflare AI Agent Chat</title>
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      height: 100vh;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      padding: 20px;
-    }
-    
-    .container {
-      background: white;
-      border-radius: 20px;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-      width: 100%;
-      max-width: 800px;
-      height: 90vh;
-      max-height: 700px;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    
-    .header {
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      padding: 20px 30px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    
-    .header h1 {
-      font-size: 24px;
-      font-weight: 600;
-    }
-    
-    .status {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 14px;
-    }
-    
-    .status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: #4ade80;
-      animation: pulse 2s infinite;
-    }
-    
-    .status-dot.disconnected {
-      background: #ef4444;
-      animation: none;
-    }
-    
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
-    }
-    
-    .messages {
-      flex: 1;
-      overflow-y: auto;
-      padding: 30px;
-      background: #f8f9fa;
-    }
-    
-    .message {
-      margin-bottom: 20px;
-      display: flex;
-      gap: 12px;
-      animation: slideIn 0.3s ease;
-    }
-    
-    @keyframes slideIn {
-      from {
-        opacity: 0;
-        transform: translateY(10px);
-      }
-      to {
-        opacity: 1;
-        transform: translateY(0);
-      }
-    }
-    
-    .message.user {
-      flex-direction: row-reverse;
-    }
-    
-    .avatar {
-      width: 40px;
-      height: 40px;
-      border-radius: 50%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 20px;
-      flex-shrink: 0;
-    }
-    
-    .message.user .avatar {
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    }
-    
-    .message.assistant .avatar {
-      background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-    }
-    
-    .bubble {
-      max-width: 70%;
-      padding: 15px 20px;
-      border-radius: 18px;
-      line-height: 1.5;
-      word-wrap: break-word;
-    }
-    
-    .message.user .bubble {
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      border-bottom-right-radius: 4px;
-    }
-    
-    .message.assistant .bubble {
-      background: white;
-      color: #333;
-      border-bottom-left-radius: 4px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-    }
-    
-    .typing {
-      display: flex;
-      gap: 4px;
-      padding: 15px 20px;
-    }
-    
-    .typing span {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #999;
-      animation: typing 1.4s infinite;
-    }
-    
-    .typing span:nth-child(2) { animation-delay: 0.2s; }
-    .typing span:nth-child(3) { animation-delay: 0.4s; }
-    
-    @keyframes typing {
-      0%, 60%, 100% { transform: translateY(0); }
-      30% { transform: translateY(-10px); }
-    }
-    
-    .input-area {
-      padding: 20px 30px;
-      background: white;
-      border-top: 1px solid #e5e7eb;
-      display: flex;
-      gap: 12px;
-    }
-    
-    .input-wrapper {
-      flex: 1;
-      position: relative;
-    }
-    
-    #messageInput {
-      width: 100%;
-      padding: 15px 20px;
-      border: 2px solid #e5e7eb;
-      border-radius: 25px;
-      font-size: 15px;
-      outline: none;
-      transition: border-color 0.3s;
-    }
-    
-    #messageInput:focus {
-      border-color: #667eea;
-    }
-    
-    button {
-      padding: 15px 30px;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      border: none;
-      border-radius: 25px;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: transform 0.2s, box-shadow 0.2s;
-    }
-    
-    button:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-    }
-    
-    button:active {
-      transform: translateY(0);
-    }
-    
-    button:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-      transform: none;
-    }
-    
-    .clear-btn {
-      padding: 10px 20px;
-      background: #ef4444;
-      font-size: 13px;
-    }
-    
-    .empty-state {
-      text-align: center;
-      color: #999;
-      padding: 60px 20px;
-    }
-    
-    .empty-state h2 {
-      font-size: 28px;
-      margin-bottom: 10px;
-      color: #667eea;
-    }
-    
-    .empty-state p {
-      font-size: 16px;
-    }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Agent Chat</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .chat-container {
+            width: 90%;
+            max-width: 800px;
+            height: 90vh;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .chat-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .chat-header h1 {
+            font-size: 24px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 14px;
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #4ade80;
+            animation: pulse 2s infinite;
+        }
+        .status-dot.disconnected {
+            background: #ef4444;
+            animation: none;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .clear-btn {
+            background: rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.3);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+        .clear-btn:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .message {
+            display: flex;
+            gap: 10px;
+            animation: slideIn 0.3s ease-out;
+        }
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        .message.user {
+            flex-direction: row-reverse;
+        }
+        .message-content {
+            max-width: 70%;
+            padding: 12px 16px;
+            border-radius: 18px;
+            word-wrap: break-word;
+        }
+        .message.user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+        .message.assistant .message-content {
+            background: #f3f4f6;
+            color: #1f2937;
+            border-bottom-left-radius: 4px;
+        }
+        .welcome-message {
+            text-align: center;
+            padding: 40px 20px;
+            color: #6b7280;
+        }
+        .welcome-message h2 {
+            font-size: 28px;
+            margin-bottom: 10px;
+            color: #667eea;
+        }
+        .input-area {
+            padding: 20px;
+            background: #f9fafb;
+            border-top: 1px solid #e5e7eb;
+            display: flex;
+            gap: 10px;
+        }
+        #messageInput {
+            flex: 1;
+            padding: 12px 16px;
+            border: 2px solid #e5e7eb;
+            border-radius: 12px;
+            font-size: 16px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        #messageInput:focus {
+            border-color: #667eea;
+        }
+        #sendBtn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 12px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s;
+            font-weight: 600;
+        }
+        #sendBtn:hover:not(:disabled) {
+            transform: scale(1.05);
+        }
+        #sendBtn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .typing-indicator {
+            display: none;
+            padding: 12px 16px;
+            background: #f3f4f6;
+            border-radius: 18px;
+            width: fit-content;
+        }
+        .typing-indicator.active {
+            display: block;
+        }
+        .typing-indicator span {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #9ca3af;
+            margin: 0 2px;
+            animation: typing 1.4s infinite;
+        }
+        .typing-indicator span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        .typing-indicator span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+        @keyframes typing {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-10px); }
+        }
+    </style>
 </head>
 <body>
-  <div class="container">
-    <div class="header">
-      <h1>🤖 AI Agent Chat</h1>
-      <div>
-        <div class="status">
-          <span class="status-dot" id="statusDot"></span>
-          <span id="statusText">Connecting...</span>
-        </div>
-        <button class="clear-btn" onclick="clearChat()">Clear Chat</button>
-      </div>
-    </div>
-    
-    <div class="messages" id="messages">
-      <div class="empty-state">
-        <h2>👋 Welcome!</h2>
-        <p>Start chatting with your AI agent powered by Cloudflare</p>
-      </div>
-    </div>
-    
-    <div class="input-area">
-      <div class="input-wrapper">
-        <input 
-          type="text" 
-          id="messageInput" 
-          placeholder="Type your message..."
-          autocomplete="off"
-        />
-      </div>
-      <button onclick="sendMessage()" id="sendBtn">Send</button>
-    </div>
-  </div>
-
-  <script>
-    const messagesDiv = document.getElementById('messages');
-    const messageInput = document.getElementById('messageInput');
-    const sendBtn = document.getElementById('sendBtn');
-    const statusText = document.getElementById('statusText');
-    const statusDot = document.getElementById('statusDot');
-    
-    let agentId = localStorage.getItem('agentId') || crypto.randomUUID();
-    localStorage.setItem('agentId', agentId);
-    
-    let ws = null;
-    let isConnecting = false;
-    
-    function updateStatus(status) {
-      statusText.textContent = status;
-      if (status === 'Connected') {
-        statusDot.classList.remove('disconnected');
-      } else {
-        statusDot.classList.add('disconnected');
-      }
-    }
-    
-    function connectWebSocket() {
-      if (isConnecting || (ws && ws.readyState === WebSocket.OPEN)) return;
-      
-      isConnecting = true;
-      updateStatus('Connecting...');
-      
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = protocol + '//' + window.location.host + '/agent?id=' + agentId;
-      
-      ws = new WebSocket(wsUrl);
-      
-      ws.onopen = () => {
-        isConnecting = false;
-        updateStatus('Connected');
-        console.log('WebSocket connected');
-      };
-      
-      ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'welcome') {
-            console.log('Welcome message:', data.message);
-          } else if (data.response) {
-            removeTypingIndicator();
-            addMessage(data.response, 'assistant');
-          }
-        } catch (e) {
-          console.error('Failed to parse message:', e);
-        }
-      };
-      
-      ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        updateStatus('Error - Using HTTP');
-      };
-      
-      ws.onclose = () => {
-        isConnecting = false;
-        updateStatus('Disconnected - Using HTTP');
-        console.log('WebSocket disconnected');
-        // Try to reconnect after 3 seconds
-        setTimeout(() => {
-          if (!ws || ws.readyState === WebSocket.CLOSED) {
-            connectWebSocket();
-          }
-        }, 3000);
-      };
-    }
-    
-    function addMessage(text, type) {
-      const emptyState = messagesDiv.querySelector('.empty-state');
-      if (emptyState) emptyState.remove();
-      
-      const messageDiv = document.createElement('div');
-      messageDiv.className = 'message ' + type;
-      
-      const avatar = document.createElement('div');
-      avatar.className = 'avatar';
-      avatar.textContent = type === 'user' ? '👤' : '🤖';
-      
-      const bubble = document.createElement('div');
-      bubble.className = 'bubble';
-      bubble.textContent = text;
-      
-      messageDiv.appendChild(avatar);
-      messageDiv.appendChild(bubble);
-      messagesDiv.appendChild(messageDiv);
-      messagesDiv.scrollTop = messagesDiv.scrollHeight;
-    }
-    
-    function addTypingIndicator() {
-      const typingDiv = document.createElement('div');
-      typingDiv.className = 'message assistant';
-      typingDiv.id = 'typing-indicator';
-      
-      const avatar = document.createElement('div');
-      avatar.className = 'avatar';
-      avatar.textContent = '🤖';
-      
-      const bubble = document.createElement('div');
-      bubble.className = 'bubble typing';
-      bubble.innerHTML = '<span></span><span></span><span></span>';
-      
-      typingDiv.appendChild(avatar);
-      typingDiv.appendChild(bubble);
-      messagesDiv.appendChild(typingDiv);
-      messagesDiv.scrollTop = messagesDiv.scrollHeight;
-    }
-    
-    function removeTypingIndicator() {
-      const typing = document.getElementById('typing-indicator');
-      if (typing) typing.remove();
-    }
-    
-    async function sendMessage() {
-      const message = messageInput.value.trim();
-      if (!message) return;
-      
-      addMessage(message, 'user');
-      messageInput.value = '';
-      sendBtn.disabled = true;
-      addTypingIndicator();
-      
-      try {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ content: message }));
-        } else {
-          // Fallback to HTTP
-          const response = await fetch('/agent?id=' + agentId + '/message', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: message })
-          });
-          
-          const data = await response.json();
-          removeTypingIndicator();
-          
-          if (data.response) {
-            addMessage(data.response, 'assistant');
-          } else if (data.error) {
-            addMessage('Error: ' + data.error, 'assistant');
-          }
-        }
-      } catch (error) {
-        removeTypingIndicator();
-        addMessage('Failed to send message. Please try again.', 'assistant');
-        console.error('Send error:', error);
-      } finally {
-        sendBtn.disabled = false;
-        messageInput.focus();
-      }
-    }
-    
-    async function clearChat() {
-      if (!confirm('Clear chat history?')) return;
-      
-      try {
-        const response = await fetch('/agent?id=' + agentId + '/clear', {
-          method: 'POST'
-        });
-        
-        if (response.ok) {
-          messagesDiv.innerHTML = \`
-            <div class="empty-state">
-              <h2>👋 Welcome!</h2>
-              <p>Start chatting with your AI agent powered by Cloudflare</p>
+    <div class="chat-container">
+        <div class="chat-header">
+            <h1>🤖 AI Agent Chat</h1>
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <div class="status">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span id="statusText">Connecting...</span>
+                </div>
+                <button class="clear-btn" onclick="clearChat()">Clear Chat</button>
             </div>
-          \`;
+        </div>
+        
+        <div class="messages" id="messages">
+            <div class="welcome-message">
+                <h2>👋 Welcome!</h2>
+                <p>Start chatting with your AI agent powered by Cloudflare</p>
+            </div>
+        </div>
+        
+        <div class="input-area">
+            <input type="text" id="messageInput" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
+            <button id="sendBtn" onclick="sendMessage()">Send ✉️</button>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        const agentId = new URLSearchParams(window.location.search).get('id') || crypto.randomUUID();
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = \`\${protocol}//\${window.location.host}/agent?id=\${agentId}\`;
+            
+            console.log('Connecting to:', wsUrl);
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                updateStatus(true);
+                reconnectAttempts = 0;
+            };
+            
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log('Received:', data);
+                    
+                    if (data.type === 'welcome') {
+                        // Don't display welcome message as a chat message
+                        return;
+                    }
+                    
+                    if (data.success && data.response) {
+                        hideTypingIndicator();
+                        addMessage('assistant', data.response);
+                    } else if (!data.success && data.error) {
+                        hideTypingIndicator();
+                        addMessage('assistant', 'Error: ' + data.error);
+                    }
+                } catch (error) {
+                    console.error('Error parsing message:', error);
+                }
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                updateStatus(false);
+                
+                // Attempt to reconnect
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
+                    console.log(\`Reconnecting in \${delay}ms (attempt \${reconnectAttempts})\`);
+                    setTimeout(connectWebSocket, delay);
+                }
+            };
         }
-      } catch (error) {
-        console.error('Clear error:', error);
-        alert('Failed to clear chat');
-      }
-    }
-    
-    messageInput.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') sendMessage();
-    });
-    
-    // Initialize
-    connectWebSocket();
-    messageInput.focus();
-  </script>
+
+        function updateStatus(connected) {
+            const statusDot = document.getElementById('statusDot');
+            const statusText = document.getElementById('statusText');
+            
+            if (connected) {
+                statusDot.classList.remove('disconnected');
+                statusText.textContent = 'Connected';
+            } else {
+                statusDot.classList.add('disconnected');
+                statusText.textContent = 'Disconnected';
+            }
+        }
+
+        function addMessage(role, content) {
+            const messagesDiv = document.getElementById('messages');
+            const welcomeMsg = messagesDiv.querySelector('.welcome-message');
+            if (welcomeMsg) {
+                welcomeMsg.remove();
+            }
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = \`message \${role}\`;
+            messageDiv.innerHTML = \`
+                <div class="message-content">\${escapeHtml(content)}</div>
+            \`;
+            
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function showTypingIndicator() {
+            const messagesDiv = document.getElementById('messages');
+            const indicator = document.createElement('div');
+            indicator.className = 'typing-indicator active';
+            indicator.id = 'typingIndicator';
+            indicator.innerHTML = '<span></span><span></span><span></span>';
+            messagesDiv.appendChild(indicator);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function hideTypingIndicator() {
+            const indicator = document.getElementById('typingIndicator');
+            if (indicator) {
+                indicator.remove();
+            }
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            
+            if (!message || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            
+            addMessage('user', message);
+            showTypingIndicator();
+            
+            ws.send(JSON.stringify({
+                content: message
+            }));
+            
+            input.value = '';
+        }
+
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+
+        async function clearChat() {
+            if (!confirm('Are you sure you want to clear the chat history?')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(\`/agent/clear?id=\${agentId}\`, {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    document.getElementById('messages').innerHTML = \`
+                        <div class="welcome-message">
+                            <h2>👋 Welcome!</h2>
+                            <p>Start chatting with your AI agent powered by Cloudflare</p>
+                        </div>
+                    \`;
+                }
+            } catch (error) {
+                console.error('Error clearing chat:', error);
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Connect on page load
+        connectWebSocket();
+    </script>
 </body>
 </html>`;
 
@@ -598,40 +513,41 @@ const HTML_PAGE = `<!DOCTYPE html>
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    
+
     // Serve the frontend HTML
     if (url.pathname === "/" || url.pathname === "/index.html") {
       return new Response(HTML_PAGE, {
-        headers: { 
+        headers: {
           "Content-Type": "text/html;charset=UTF-8",
           "Cache-Control": "no-cache"
         }
       });
     }
-    
-    // Agent endpoint - pass through to Durable Object
-    if (url.pathname.startsWith("/agent")) {
+
+    // Clear chat history endpoint
+    if (url.pathname === "/agent/clear") {
       const agentId = url.searchParams.get("id") || crypto.randomUUID();
       const id = env.ChatAgent.idFromName(agentId);
       const stub = env.ChatAgent.get(id);
       
-      // For clear endpoint, rewrite the path
-      if (url.pathname.includes("/clear")) {
-        const newUrl = new URL(request.url);
-        newUrl.pathname = "/clear";
-        request = new Request(newUrl, request);
-      } else if (url.pathname.includes("/message")) {
-        const newUrl = new URL(request.url);
-        newUrl.pathname = "/message";
-        request = new Request(newUrl, request);
-      }
+      return stub.fetch(new Request(`http://agent/clear`, {
+        method: "POST"
+      }));
+    }
+
+    // Agent WebSocket/API endpoint
+    if (url.pathname === "/agent") {
+      const agentId = url.searchParams.get("id") || crypto.randomUUID();
+      const id = env.ChatAgent.idFromName(agentId);
+      const stub = env.ChatAgent.get(id);
       
+      // Pass through the request to the Durable Object
       return stub.fetch(request);
     }
 
     // Health check
     if (url.pathname === "/health") {
-      return new Response(JSON.stringify({ 
+      return new Response(JSON.stringify({
         status: "healthy",
         timestamp: new Date().toISOString()
       }), {
