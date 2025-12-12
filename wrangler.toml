@@ -11,6 +11,14 @@ class_name = "ChatAgent"
 # Migration to enable SQL storage for the Agent
 [[migrations]]
 tag = "v1"
+new_sqlite_classes = ["AIAgent"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["AIAgent"]
+
+[[migrations]]
+tag = "v3"
 new_sqlite_classes = ["ChatAgent"]
 
 # Workers AI binding for running AI models
