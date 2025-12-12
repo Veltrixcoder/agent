@@ -2,27 +2,85 @@ import { Agent } from "agents";
 
 // Define your AI Agent
 export class ChatAgent extends Agent {
-  async onConnect(metadata) {
-    await this.setState({
-      conversationHistory: [],
-      userPreferences: metadata?.preferences || {},
-      createdAt: new Date().toISOString()
-    });
+  async fetch(request) {
+    // Handle WebSocket upgrade
+    if (request.headers.get("Upgrade") === "websocket") {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      
+      this.ctx.acceptWebSocket(server);
+      
+      // Initialize state when WebSocket connects
+      const state = await this.getState();
+      if (!state.conversationHistory) {
+        await this.setState({
+          conversationHistory: [],
+          createdAt: new Date().toISOString()
+        });
+      }
+      
+      // Send welcome message
+      server.send(JSON.stringify({
+        type: "welcome",
+        message: "Connected to AI Agent! How can I help you today?"
+      }));
+      
+      return new Response(null, {
+        status: 101,
+        webSocket: client
+      });
+    }
     
-    return {
-      message: "Connected to AI Agent! How can I help you today?",
-      agentId: this.id
-    };
+    // Handle HTTP POST for messages
+    const url = new URL(request.url);
+    if (url.pathname === "/message" && request.method === "POST") {
+      const body = await request.json();
+      const response = await this.handleMessage(body.content);
+      return new Response(JSON.stringify(response), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    
+    // Handle clear history
+    if (url.pathname === "/clear" && request.method === "POST") {
+      await this.setState({
+        conversationHistory: [],
+        lastInteraction: new Date().toISOString()
+      });
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    
+    return new Response("Not Found", { status: 404 });
   }
-
-  async onMessage(message) {
+  
+  async webSocketMessage(ws, message) {
+    try {
+      const data = JSON.parse(message);
+      const response = await this.handleMessage(data.content);
+      ws.send(JSON.stringify(response));
+    } catch (error) {
+      console.error("WebSocket message error:", error);
+      ws.send(JSON.stringify({
+        success: false,
+        error: "Failed to process message"
+      }));
+    }
+  }
+  
+  async webSocketClose(ws, code, reason) {
+    console.log("WebSocket closed:", code, reason);
+  }
+  
+  async handleMessage(content) {
     try {
       const state = await this.getState();
       const history = state.conversationHistory || [];
       
       history.push({
         role: "user",
-        content: message.content,
+        content: content,
         timestamp: new Date().toISOString()
       });
 
@@ -62,26 +120,6 @@ export class ChatAgent extends Agent {
         error: "Failed to process your message. Please try again."
       };
     }
-  }
-
-  async clearHistory() {
-    await this.setState({
-      conversationHistory: [],
-      lastInteraction: new Date().toISOString()
-    });
-    return { success: true, message: "Conversation history cleared" };
-  }
-
-  async getSummary() {
-    const state = await this.getState();
-    const history = state.conversationHistory || [];
-    
-    return {
-      totalMessages: history.length,
-      createdAt: state.createdAt,
-      lastInteraction: state.lastInteraction,
-      messagePreview: history.slice(-3)
-    };
   }
 }
 
@@ -552,26 +590,11 @@ export default {
     // Agent API endpoint
     if (url.pathname === "/agent") {
       const agentId = url.searchParams.get("id") || crypto.randomUUID();
-      const agent = env.ChatAgent.get(env.ChatAgent.idFromName(agentId));
+      const id = env.ChatAgent.idFromName(agentId);
+      const stub = env.ChatAgent.get(id);
       
-      // WebSocket connection
-      if (request.headers.get("Upgrade") === "websocket") {
-        return agent.fetch(request);
-      }
-      
-      // HTTP POST for messages
-      if (request.method === "POST") {
-        const body = await request.json();
-        const response = await agent.fetch(new Request(`http://agent/message`, {
-          method: "POST",
-          body: JSON.stringify(body)
-        }));
-        return response;
-      }
-      
-      return new Response(JSON.stringify({ agentId }), {
-        headers: { "Content-Type": "application/json" }
-      });
+      // Pass through the request to the Durable Object
+      return stub.fetch(request);
     }
 
     // Health check
